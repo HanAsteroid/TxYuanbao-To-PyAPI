@@ -8,11 +8,8 @@ import time
 
 # 配置浏览器选项，当然你使用其他浏览器也ok
 def autoh(url):
-# 设置EdgeDriver路径
-    edge_driver_path = "msedgedriver.exe"  # Windows系统
-
-    # 创建服务
-    service2 = Service(edge_driver_path)
+    # 使用 Selenium Manager 自动管理驱动（无需手动下载或指定路径）
+    service2 = Service()
 
     # 启动
     driver = webdriver.Edge(service=service2)

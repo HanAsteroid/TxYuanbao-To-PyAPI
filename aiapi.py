@@ -3,7 +3,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 from setbrowser import *
-import imghdr
 import json
 import time
 import os
@@ -21,11 +20,7 @@ driver = autoh('https://yuanbao.tencent.com/login')
 driver.refresh()
 print("浏览器初始化完成")
 
-def validate_image(file_stream):
-    """检查图片格式是否有效"""
-    file_type = imghdr.what(None, h=file_stream.read(1024))
-    file_stream.seek(0)
-    return file_type in {'jpeg', 'png', 'gif', 'webp', 'jpg', 'bmp'}
+    
 
 def wait_for_stable_text(element, wait_time=2, timeout=999):
     """等待文本稳定"""
@@ -39,7 +34,8 @@ def wait_for_stable_text(element, wait_time=2, timeout=999):
                 r'找到\d+相关资料',
                 r'正在分析',
                 r'正在处理',
-                r'正在生成'
+                r'正在生成',
+                r'引用\d+篇资料作为参考'
             ]
         
         def should_skip(self, text):
@@ -84,7 +80,7 @@ def get_new_message(driver, timeout=999):
             self.known_texts = known_texts
         
         def __call__(self, driver):
-            current_messages = driver.find_elements(By.CSS_SELECTOR, '.agent-chat__bubble__content')
+            current_messages = driver.find_elements(By.CSS_SELECTOR, '.agent-chat__bubble__content .agent-chat__speech-card__text')
             for msg in current_messages:
                 if msg.text not in self.known_texts:
                     print(f"发现新消息: {msg.text}")
@@ -273,8 +269,13 @@ def handle_request():
     
     try:
         global request_data
-        #注意！！！！！！这里可以改成request_data = request.get_json()
-        request_data = json.loads(request.get_json())
+        # 同时兼容：
+        # - 正确用法：客户端直接发送 JSON 对象（Postman 等）
+        # - 误用方式：客户端先 json.dumps，再放入 json= 参数（会变成 JSON 字符串）
+        raw_json = request.get_json(silent=True)
+        if raw_json is None:
+            return jsonify({"error": "请求体不是合法的 JSON"}), 400
+        request_data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
         if not request_data:
             print("空请求")
             return jsonify({"error": "请求数据不能为空"}), 400
