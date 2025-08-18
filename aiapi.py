@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
 from setbrowser import *
 import json
 import time
@@ -11,14 +12,62 @@ import glob
 from apscheduler.schedulers.background import BackgroundScheduler
 import threading
 import base64
+import logging
+from logging.handlers import RotatingFileHandler
 
 app = Flask(__name__)
 lock = threading.Lock()
+
+# 日志配置
+logs_dir = 'logs'
+os.makedirs(logs_dir, exist_ok=True)
+
+logger = logging.getLogger('aiapi')
+logger.setLevel(logging.INFO)
+
+_log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+
+_app_handler = RotatingFileHandler(os.path.join(logs_dir, 'app.log'), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')
+_app_handler.setLevel(logging.INFO)
+_app_handler.setFormatter(_log_formatter)
+
+_err_handler = RotatingFileHandler(os.path.join(logs_dir, 'error.log'), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')
+_err_handler.setLevel(logging.ERROR)
+_err_handler.setFormatter(_log_formatter)
+
+if not logger.handlers:
+    logger.addHandler(_app_handler)
+    logger.addHandler(_err_handler)
+
+def _sanitize_payload(data):
+    if not isinstance(data, dict):
+        return data
+    sanitized = {}
+    for key, value in data.items():
+        try:
+            if key == 'picture' or re.match(r'file\d+', str(key)):
+                if isinstance(value, str):
+                    sanitized[key] = f"<base64 length={len(value)}>"
+                else:
+                    sanitized[key] = "<binary>"
+            elif isinstance(value, (bytes, bytearray)):
+                sanitized[key] = f"<bytes length={len(value)}>"
+            else:
+                sanitized[key] = value
+        except Exception:
+            sanitized[key] = "<unserializable>"
+    return sanitized
+
+def _truncate_text(text, max_len=1000):
+    if not isinstance(text, str):
+        return text
+    return text if len(text) <= max_len else (text[:max_len] + '...<truncated>')
 
 # 初始化浏览器
 driver = autoh('https://yuanbao.tencent.com/login')
 driver.refresh()
 print("浏览器初始化完成")
+logger.info("浏览器初始化完成并已刷新")
 
     
 
@@ -67,6 +116,7 @@ def wait_for_stable_text(element, wait_time=10, timeout=999):
         )
     except Exception as e:
         print(f"等待文本超时: {str(e)}")
+        logger.error(f"等待文本超时: {str(e)}")
         raise TimeoutError(f"等待文本超时（{timeout}秒）")
 
 def get_new_message(driver, timeout=999):
@@ -93,7 +143,90 @@ def get_new_message(driver, timeout=999):
         )
     except Exception:
         print("等待新消息超时")
+        logger.error("等待新消息超时")
         raise TimeoutError("等待新消息超时")
+
+def extract_references(driver):
+    """展开引用来源抽屉并解析数据源"""
+    references = []
+    try:
+        # 预处理：移除/等待遮罩层以避免点击被拦截
+        try:
+            driver.execute_script("""
+              document.querySelectorAll('.temp-mode-guide__info,.t-dialog__mask,.t-guide,.t-popup__mask')
+                .forEach(e => e.remove());
+            """)
+        except Exception:
+            pass
+
+        try:
+            WebDriverWait(driver, 3).until(
+                EC.invisibility_of_element_located((By.CSS_SELECTOR, ".temp-mode-guide__info"))
+            )
+        except TimeoutException:
+            pass
+
+        ref_toggle = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".hyc-card-box-search-ref__content__header-wrapper"))
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", ref_toggle)
+        try:
+            WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, ".hyc-card-box-search-ref__content__header-wrapper"))
+            )
+            ref_toggle.click()
+        except ElementClickInterceptedException:
+            driver.execute_script("arguments[0].click();", ref_toggle)
+
+        # 等待抽屉与引用列表出现
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".t-drawer__body #chatReferenceList"))
+        )
+
+        items = driver.find_elements(By.CSS_SELECTOR, "#chatReferenceList .agent-dialogue-references__list .agent-dialogue-references__item")
+        for item in items:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", item)
+                card = item.find_element(By.CSS_SELECTOR, ".hyc-common-markdown__ref_card")
+                url = (card.get_attribute("data-url") or "").strip()
+                if not url:
+                    links = item.find_elements(By.CSS_SELECTOR, "a[href]")
+                    if links:
+                        url = links[0].get_attribute("href") or ""
+
+                title_text = ""
+                # 1) 精确选择器
+                title_els = item.find_elements(By.CSS_SELECTOR, ".hyc-common-markdown__ref_card-title span")
+                if not title_els:
+                    title_els = item.find_elements(By.CSS_SELECTOR, ".hyc-common-markdown__ref_card-title")
+
+                if title_els:
+                    el = title_els[0]
+                    # 优先使用 JS 读取 textContent（避免可见性/省略号影响）
+                    try:
+                        title_text = (driver.execute_script("return (arguments[0].textContent || '').trim();", el) or "").strip()
+                    except Exception:
+                        title_text = (el.text or "").strip()
+                    if not title_text:
+                        title_text = (el.get_attribute("title") or "").strip()
+
+                # 2) 兜底：从卡片本身读取 aria-label 或 title
+                if not title_text:
+                    title_text = (card.get_attribute("aria-label") or card.get_attribute("title") or "").strip()
+
+                # 3) 兜底：从任意包含 title 的元素读
+                if not title_text:
+                    any_title = item.find_elements(By.CSS_SELECTOR, "[title]")
+                    if any_title:
+                        title_text = (any_title[0].get_attribute("title") or "").strip()
+
+                if title_text or url:
+                    references.append({"title": title_text, "url": url})
+            except Exception as _:
+                continue
+    except Exception as e:
+        print(f"引用来源解析失败或未找到: {str(e)}")
+    return references
 
 def upload_image(driver, image_data):
     """上传图片文件"""
@@ -132,6 +265,7 @@ def upload_image(driver, image_data):
         return True
     except Exception as e:
         print(f"图片上传出错: {str(e)}")
+        logger.exception(f"图片上传出错: {str(e)}")
         for temp_file in glob.glob("temp_img_*.png"):
             if os.path.exists(temp_file):
                 os.remove(temp_file)
@@ -203,6 +337,7 @@ def upload_files(driver, files):
         return True
     except Exception as e:
         print(f"文件上传失败: {str(e)}")
+        logger.exception(f"文件上传失败: {str(e)}")
         for temp_file in glob.glob("temp_*"):
             if os.path.exists(temp_file):
                 os.remove(temp_file)
@@ -242,6 +377,7 @@ def change_model(driver, model):
         return True
     except Exception as e:
         print(f"模型切换失败: {str(e)}")
+        logger.exception(f"模型切换失败: {str(e)}")
         return False
     
 def refresh_page():
@@ -265,6 +401,7 @@ def handle_request():
     print("收到新请求")
     if not lock.acquire(blocking=False):
         print("系统繁忙")
+        logger.warning("系统繁忙：有并发请求被拒绝")
         return "系统繁忙，请稍后再试", 429
     
     try:
@@ -279,6 +416,10 @@ def handle_request():
         if not request_data:
             print("空请求")
             return jsonify({"error": "请求数据不能为空"}), 400
+        try:
+            logger.info(f"/hunyuan 请求: {json.dumps(_sanitize_payload(request_data), ensure_ascii=False)}")
+        except Exception:
+            logger.info(f"/hunyuan 请求(无法序列化)，keys={list(request_data.keys())}")
         
         print("处理请求数据")
         response = {}
@@ -302,6 +443,7 @@ def handle_request():
                     )
                 except Exception as e:
                     print(f"创建会话失败: {str(e)}")
+                    logger.exception(f"创建会话失败: {str(e)}")
                     return jsonify({"error": f"创建会话失败: {str(e)}"}), 500
             else:
                 print(f"切换到会话 {session_id}")
@@ -313,6 +455,7 @@ def handle_request():
                     time.sleep(2)
                 except Exception as e:
                     print(f"切换会话失败: {str(e)}")
+                    logger.exception(f"切换会话失败: {str(e)}")
                     return jsonify({"error": f"切换会话失败: {str(e)}"}), 500
         
         if request_data.get('mode'):
@@ -349,62 +492,7 @@ def handle_request():
             new_msg = get_new_message(driver)
             final_text = wait_for_stable_text(new_msg)
             
-            # 展开引用来源抽屉并解析数据源
-            references = []
-            try:
-                ref_toggle = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, ".hyc-card-box-search-ref__content__header-wrapper"))
-                )
-                ref_toggle.click()
-                
-                # 等待抽屉与引用列表出现
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, ".t-drawer__body #chatReferenceList"))
-                )
-                
-                items = driver.find_elements(By.CSS_SELECTOR, "#chatReferenceList .agent-dialogue-references__list .agent-dialogue-references__item")
-                for item in items:
-                    try:
-                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", item)
-                        card = item.find_element(By.CSS_SELECTOR, ".hyc-common-markdown__ref_card")
-                        url = (card.get_attribute("data-url") or "").strip()
-                        if not url:
-                            links = item.find_elements(By.CSS_SELECTOR, "a[href]")
-                            if links:
-                                url = links[0].get_attribute("href") or ""
-                        
-                        title_text = ""
-                        # 1) 精确选择器
-                        title_els = item.find_elements(By.CSS_SELECTOR, ".hyc-common-markdown__ref_card-title span")
-                        if not title_els:
-                            title_els = item.find_elements(By.CSS_SELECTOR, ".hyc-common-markdown__ref_card-title")
-                        
-                        if title_els:
-                            el = title_els[0]
-                            # 优先使用 JS 读取 textContent（避免可见性/省略号影响）
-                            try:
-                                title_text = (driver.execute_script("return (arguments[0].textContent || '').trim();", el) or "").strip()
-                            except Exception:
-                                title_text = (el.text or "").strip()
-                            if not title_text:
-                                title_text = (el.get_attribute("title") or "").strip()
-                        
-                        # 2) 兜底：从卡片本身读取 aria-label 或 title
-                        if not title_text:
-                            title_text = (card.get_attribute("aria-label") or card.get_attribute("title") or "").strip()
-                        
-                        # 3) 兜底：从任意包含 title 的元素读
-                        if not title_text:
-                            any_title = item.find_elements(By.CSS_SELECTOR, "[title]")
-                            if any_title:
-                                title_text = (any_title[0].get_attribute("title") or "").strip()
-                        
-                        if title_text or url:
-                            references.append({"title": title_text, "url": url})
-                    except Exception as _:
-                        continue
-            except Exception as e:
-                print(f"引用来源解析失败或未找到: {str(e)}")
+            references = extract_references(driver)
             
             print("获取会话ID")
             active = WebDriverWait(driver, 10).until(
@@ -416,18 +504,37 @@ def handle_request():
             response["text"] = final_text
             response["references"] = references
             print("请求处理完成")
+            try:
+                resp_log = {
+                    "id": current_id,
+                    "text": _truncate_text(final_text, 1000),
+                    "references_preview": references[:5],
+                    "references_total": len(references)
+                }
+                logger.info(f"/hunyuan 响应(200): {json.dumps(resp_log, ensure_ascii=False)}")
+            except Exception:
+                logger.info(f"/hunyuan 响应(200) 已返回，无法序列化日志")
             return jsonify(response)
             
         except Exception as e:
             print(f"消息发送失败: {str(e)}")
+            try:
+                logger.exception(f"消息发送失败: {str(e)}")
+            except Exception:
+                pass
             return jsonify({"error": f"消息发送失败: {str(e)}"}), 500
             
     except Exception as e:
         print(f"处理出错: {str(e)}")
+        try:
+            logger.exception(f"处理出错: {str(e)}")
+        except Exception:
+            pass
         return jsonify({"error": f"处理出错: {str(e)}"}), 500
     finally:
         lock.release()
         print("释放锁")
+        logger.info("释放锁，完成一次 /hunyuan 调用")
 
 if __name__ == '__main__':
     print("启动服务")
