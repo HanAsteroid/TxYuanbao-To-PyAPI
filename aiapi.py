@@ -22,7 +22,7 @@ print("浏览器初始化完成")
 
     
 
-def wait_for_stable_text(element, wait_time=2, timeout=999):
+def wait_for_stable_text(element, wait_time=10, timeout=999):
     """等待文本稳定"""
     class TextChecker:
         def __init__(self, element, wait_time):
@@ -349,6 +349,63 @@ def handle_request():
             new_msg = get_new_message(driver)
             final_text = wait_for_stable_text(new_msg)
             
+            # 展开引用来源抽屉并解析数据源
+            references = []
+            try:
+                ref_toggle = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, ".hyc-card-box-search-ref__content__header-wrapper"))
+                )
+                ref_toggle.click()
+                
+                # 等待抽屉与引用列表出现
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".t-drawer__body #chatReferenceList"))
+                )
+                
+                items = driver.find_elements(By.CSS_SELECTOR, "#chatReferenceList .agent-dialogue-references__list .agent-dialogue-references__item")
+                for item in items:
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", item)
+                        card = item.find_element(By.CSS_SELECTOR, ".hyc-common-markdown__ref_card")
+                        url = (card.get_attribute("data-url") or "").strip()
+                        if not url:
+                            links = item.find_elements(By.CSS_SELECTOR, "a[href]")
+                            if links:
+                                url = links[0].get_attribute("href") or ""
+                        
+                        title_text = ""
+                        # 1) 精确选择器
+                        title_els = item.find_elements(By.CSS_SELECTOR, ".hyc-common-markdown__ref_card-title span")
+                        if not title_els:
+                            title_els = item.find_elements(By.CSS_SELECTOR, ".hyc-common-markdown__ref_card-title")
+                        
+                        if title_els:
+                            el = title_els[0]
+                            # 优先使用 JS 读取 textContent（避免可见性/省略号影响）
+                            try:
+                                title_text = (driver.execute_script("return (arguments[0].textContent || '').trim();", el) or "").strip()
+                            except Exception:
+                                title_text = (el.text or "").strip()
+                            if not title_text:
+                                title_text = (el.get_attribute("title") or "").strip()
+                        
+                        # 2) 兜底：从卡片本身读取 aria-label 或 title
+                        if not title_text:
+                            title_text = (card.get_attribute("aria-label") or card.get_attribute("title") or "").strip()
+                        
+                        # 3) 兜底：从任意包含 title 的元素读
+                        if not title_text:
+                            any_title = item.find_elements(By.CSS_SELECTOR, "[title]")
+                            if any_title:
+                                title_text = (any_title[0].get_attribute("title") or "").strip()
+                        
+                        if title_text or url:
+                            references.append({"title": title_text, "url": url})
+                    except Exception as _:
+                        continue
+            except Exception as e:
+                print(f"引用来源解析失败或未找到: {str(e)}")
+            
             print("获取会话ID")
             active = WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".yb-recent-conv-list__item.active"))
@@ -357,6 +414,7 @@ def handle_request():
             
             response["id"] = current_id
             response["text"] = final_text
+            response["references"] = references
             print("请求处理完成")
             return jsonify(response)
             
