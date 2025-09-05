@@ -130,7 +130,7 @@ def get_new_message(driver, timeout=999):
             self.known_texts = known_texts
         
         def __call__(self, driver):
-            current_messages = driver.find_elements(By.CSS_SELECTOR, '.agent-chat__bubble__content .agent-chat__speech-card__text')
+            current_messages = driver.find_elements(By.CSS_SELECTOR, '.agent-chat__bubble__content .agent-chat__conv--ai__speech_show')
             for msg in current_messages:
                 if msg.text not in self.known_texts:
                     print(f"发现新消息: {msg.text}")
@@ -349,7 +349,7 @@ def change_model(driver, model):
     try:
         print("点击模型切换按钮")
         switch_btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, ".style__switch-model--arrow___LxKWQ"))
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "[dt-button-id='model_switch']"))
         )
         switch_btn.click()
         time.sleep(1)
@@ -484,7 +484,7 @@ def handle_request():
             
             print("发送消息")
             send_btn = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, ".style__send-btn___ZsLmU"))
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "[id='yuanbao-send-btn']"))
             )
             send_btn.click()
             
