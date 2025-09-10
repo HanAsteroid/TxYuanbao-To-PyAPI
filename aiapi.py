@@ -3,6 +3,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
+from selenium.webdriver.common.action_chains import ActionChains
 from setbrowser import *
 import json
 import time
@@ -227,6 +228,286 @@ def extract_references(driver):
     except Exception as e:
         print(f"引用来源解析失败或未找到: {str(e)}")
     return references
+
+def _hover_and_reveal_dropdown(driver, item, timeout=3):
+    """将会话项的下拉触发器显示出来并返回触发器元素。"""
+    try:
+        try:
+            ActionChains(driver).move_to_element(item).pause(0.2).perform()
+        except Exception:
+            pass
+        # 强制显示触发器
+        try:
+            driver.execute_script(
+                """
+                const item = arguments[0];
+                const el = item.querySelector('.yb-recent-conv-list__dropdown-trigger');
+                if (el) {
+                  el.style.display = 'flex';
+                  el.style.pointerEvents = 'auto';
+                }
+                const evt = new MouseEvent('mouseover', {bubbles: true});
+                item.dispatchEvent(evt);
+                return el;
+                """,
+                item,
+            )
+        except Exception:
+            pass
+
+        end_time = time.time() + timeout
+        last = None
+        while time.time() < end_time:
+            try:
+                last = item.find_element(By.CSS_SELECTOR, ".yb-recent-conv-list__dropdown-trigger")
+                if last.is_displayed():
+                    return last
+            except Exception:
+                pass
+            time.sleep(0.2)
+        return last or item.find_element(By.CSS_SELECTOR, ".yb-recent-conv-list__dropdown-trigger")
+    except Exception:
+        return item.find_element(By.CSS_SELECTOR, ".yb-recent-conv-list__dropdown-trigger")
+
+def delete_active_conversation(driver, timeout=12):
+    """删除聊天侧边栏中当前激活的会话。
+
+    步骤：
+    1. 在 `.yb-recent-conv-list__item.active` 中点击右侧 `yb-recent-conv-list__dropdown-trigger`。
+    2. 等待下拉弹层出现后，点击“删除”。
+    3. 若有确认框，点击“删除/确定/确认”。
+    """
+    print("准备删除当前会话…")
+    try:
+        # 1) 获取激活项与 id
+        active_item = WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".yb-recent-conv-list__item.active"))
+        )
+        active_id = active_item.get_attribute("dt-cid") or ""
+        print(f"当前激活会话 dt-cid={active_id}")
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", active_item)
+
+        # 尝试移除可能遮挡点击的蒙层
+        try:
+            driver.execute_script("""
+              document.querySelectorAll('.temp-mode-guide__info,.t-dialog__mask,.t-guide,.t-popup__mask')
+                .forEach(e => e.remove());
+            """)
+        except Exception:
+            pass
+
+        # 2) 打开下拉菜单
+        trigger = _hover_and_reveal_dropdown(driver, active_item)
+        try:
+            WebDriverWait(driver, 3).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, ".yb-recent-conv-list__item.active .yb-recent-conv-list__dropdown-trigger"))
+            )
+            try:
+                trigger.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", trigger)
+        except ElementClickInterceptedException:
+            driver.execute_script("arguments[0].click();", trigger)
+
+        # 3) 等待菜单元素
+        try:
+            menu = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".t-portal-wrapper .yb-recent-conv-list__drop-down .t-dropdown__menu"))
+            )
+        except TimeoutException:
+            # 兜底：再点击一次触发器
+            try:
+                driver.execute_script("arguments[0].click();", trigger)
+            except Exception:
+                pass
+            menu = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".t-portal-wrapper .t-dropdown__menu"))
+            )
+
+        # 4) 精确定位“删除”项：优先使用包含文本的 li，其次遍历 li 文本
+        delete_item = None
+        try:
+            delete_item = WebDriverWait(driver, 2).until(
+                EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'t-portal-wrapper')]//li[contains(@class,'t-dropdown__item')]//*[contains(text(),'删除')]/ancestor::li"))
+            )
+        except Exception:
+            pass
+        if delete_item is None:
+            try:
+                items = menu.find_elements(By.CSS_SELECTOR, "li.t-dropdown__item")
+                for it in items:
+                    txt = (it.text or "").strip()
+                    if "删除" in txt or "Delete" in txt:
+                        delete_item = it
+                        break
+            except Exception:
+                pass
+        if delete_item is None:
+            raise Exception("未找到‘删除’菜单项")
+
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", delete_item)
+        try:
+            delete_item.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", delete_item)
+
+        # 5) 处理确认弹窗
+        time.sleep(0.5)
+        try:
+            confirm_btn = WebDriverWait(driver, 3).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".t-dialog__footer .t-button--theme-danger, .t-popconfirm__confirm .t-button"))
+            )
+            try:
+                confirm_btn.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", confirm_btn)
+        except Exception:
+            # 兜底：按文本匹配
+            try:
+                confirm2 = WebDriverWait(driver, 2).until(
+                    EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'t-dialog') or contains(@class,'t-popup')]//*[self::button or self::span or self::div][contains(text(),'删除') or contains(text(),'确定') or contains(text(),'确认')]"))
+                )
+                try:
+                    confirm2.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", confirm2)
+            except Exception:
+                pass
+
+        # 6) 等待该会话从列表中消失或至少不再是激活项
+        try:
+            WebDriverWait(driver, 6).until(
+                EC.invisibility_of_element_located((By.CSS_SELECTOR, f".yb-recent-conv-list__item[dt-cid='{active_id}']"))
+            )
+        except Exception:
+            try:
+                still = driver.find_elements(By.CSS_SELECTOR, f".yb-recent-conv-list__item[dt-cid='{active_id}']")
+                if still and "active" in (still[0].get_attribute("class") or ""):
+                    raise Exception("会话仍为激活状态，疑似删除失败")
+            except Exception:
+                pass
+
+        print("删除会话完成")
+        logger.info("删除会话完成")
+        return True
+    except Exception as e:
+        print(f"删除会话失败: {str(e)}")
+        try:
+            logger.exception(f"删除会话失败: {str(e)}")
+        except Exception:
+            pass
+        return False
+
+def delete_conversation_by_cid(driver, cid, timeout=12):
+    """根据 dt-cid 删除聊天侧边栏中指定的会话。"""
+    if not cid:
+        print("无效的会话ID，取消删除")
+        return False
+    print(f"准备按ID删除会话… cid={cid}")
+    try:
+        # 滚动并找到对应项
+        item = WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, f".yb-recent-conv-list__item[dt-cid='{cid}']"))
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", item)
+
+        try:
+            driver.execute_script("""
+              document.querySelectorAll('.temp-mode-guide__info,.t-dialog__mask,.t-guide,.t-popup__mask')
+                .forEach(e => e.remove());
+            """)
+        except Exception:
+            pass
+
+        trigger = _hover_and_reveal_dropdown(driver, item)
+        try:
+            WebDriverWait(driver, 3).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, f".yb-recent-conv-list__item[dt-cid='{cid}'] .yb-recent-conv-list__dropdown-trigger"))
+            )
+            try:
+                trigger.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", trigger)
+        except ElementClickInterceptedException:
+            driver.execute_script("arguments[0].click();", trigger)
+
+        # 等待菜单
+        try:
+            menu = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".t-portal-wrapper .yb-recent-conv-list__drop-down .t-dropdown__menu"))
+            )
+        except TimeoutException:
+            try:
+                driver.execute_script("arguments[0].click();", trigger)
+            except Exception:
+                pass
+            menu = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".t-portal-wrapper .t-dropdown__menu"))
+            )
+
+        # 找到删除项
+        delete_item = None
+        try:
+            delete_item = WebDriverWait(driver, 2).until(
+                EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'t-portal-wrapper')]//li[contains(@class,'t-dropdown__item')]//*[contains(text(),'删除')]/ancestor::li"))
+            )
+        except Exception:
+            pass
+        if delete_item is None:
+            try:
+                for it in menu.find_elements(By.CSS_SELECTOR, "li.t-dropdown__item"):
+                    txt = (it.text or "").strip()
+                    if "删除" in txt or "Delete" in txt:
+                        delete_item = it
+                        break
+            except Exception:
+                pass
+        if delete_item is None:
+            raise Exception("未找到‘删除’菜单项")
+
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", delete_item)
+        try:
+            delete_item.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", delete_item)
+
+        # 确认弹窗
+        time.sleep(0.5)
+        try:
+            confirm_btn = WebDriverWait(driver, 3).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".t-dialog__footer .t-button--theme-danger, .t-popconfirm__confirm .t-button"))
+            )
+            try:
+                confirm_btn.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", confirm_btn)
+        except Exception:
+            try:
+                confirm2 = WebDriverWait(driver, 2).until(
+                    EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'t-dialog') or contains(@class,'t-popup')]//*[self::button or self::span or self::div][contains(text(),'删除') or contains(text(),'确定') or contains(text(),'确认')]"))
+                )
+                try:
+                    confirm2.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", confirm2)
+            except Exception:
+                pass
+
+        # 等待该 cid 元素消失
+        WebDriverWait(driver, 6).until(
+            EC.invisibility_of_element_located((By.CSS_SELECTOR, f".yb-recent-conv-list__item[dt-cid='{cid}']"))
+        )
+
+        print("按ID删除会话完成")
+        logger.info(f"按ID删除会话完成 cid={cid}")
+        return True
+    except Exception as e:
+        print(f"按ID删除会话失败: {str(e)}")
+        try:
+            logger.exception(f"按ID删除会话失败: {str(e)}")
+        except Exception:
+            pass
+        return False
 
 def upload_image(driver, image_data):
     """上传图片文件"""
@@ -484,7 +765,7 @@ def handle_request():
             
             print("发送消息")
             send_btn = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "[id='yuanbao-send-btn']"))
+                EC.element_to_be_clickable((By.CSS_SELECTOR, ".agent-dialogue__content--common__input-box [id='yuanbao-send-btn']"))
             )
             send_btn.click()
             
@@ -503,6 +784,26 @@ def handle_request():
             response["id"] = current_id
             response["text"] = final_text
             response["references"] = references
+            
+            # 删除操作改为异步在响应返回后执行，避免阻塞与页面状态竞争
+            try:
+                auto_delete = request_data.get('auto_delete', True)
+                if auto_delete:
+                    target_cid = current_id
+                    def _async_delete(cid):
+                        try:
+                            time.sleep(0.8)
+                            ok = delete_conversation_by_cid(driver, cid)
+                            print(f"异步删除结果 cid={cid}: {ok}")
+                            try:
+                                logger.info(f"异步删除结果 cid={cid}: {ok}")
+                            except Exception:
+                                pass
+                        except Exception as _:
+                            pass
+                    threading.Thread(target=_async_delete, args=(target_cid,), daemon=True).start()
+            except Exception:
+                pass
             print("请求处理完成")
             try:
                 resp_log = {
